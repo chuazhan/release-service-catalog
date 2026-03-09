@@ -1,0 +1,329 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: rh-sign-rpm
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: sign-rpm
+spec:
+  description: |-
+    Tekton task to create internalrequests to sign rpms
+  params:
+    - name: snapshotPath
+      type: string
+      description: |
+        Path to the JSON file of the mapped Snapshot spec in the data workspace
+    - name: dataPath
+      type: string
+      description: |
+        Path to the JSON file of the merged data to use in the data workspace
+    - name: releasePlanAdmissionPath
+      description: Path to the JSON string of the releasePlanAdmission in the data workspace
+      type: string
+    - name: requester
+      type: string
+      description: Name of the user that requested the signing, for auditing purposes
+    - name: requestTimeout
+      type: string
+      default: "1800"
+      description: InternalRequest timeout
+    - name: concurrentLimit
+      type: string
+      description: The maximum number of RPMs to be processed at once
+      default: "16"
+    - name: pipelineRunUid
+      type: string
+      description: The uid of the current pipelineRun. Used as a label value when creating internal requests
+    - name: ociStorage
+      description: The OCI repository where the Trusted Artifacts are stored
+      type: string
+      default: "empty"
+    - name: sourceDataArtifact
+      type: string
+      description: Location of trusted artifacts to be used to populate data directory
+      default: ""
+    - name: ociArtifactExpiresAfter
+      description: Expiration date for the trusted artifacts created in the
+        OCI repository. An empty string means the artifacts do not expire
+      type: string
+      default: "1d"
+    - name: trustedArtifactsDebug
+      description: Flag to enable debug logging in trusted artifacts. Set to a non-empty string to enable
+      type: string
+      default: ""
+    - name: orasOptions
+      description: oras options to pass to Trusted Artifacts calls
+      type: string
+      default: ""
+    - name: dataDir
+      description: The location where data will be stored
+      type: string
+      default: /var/workdir/release
+    - name: taskGitUrl
+      type: string
+      description: The url to the git repo where the release-service-catalog tasks and stepactions to be used are stored
+    - name: taskGitRevision
+      type: string
+      description: The revision in the taskGitUrl repo to be used
+  results:
+    - name: sourceDataArtifact
+      type: string
+      description: Produced trusted data artifact
+  volumes:
+    - name: workdir
+      emptyDir: {}
+  stepTemplate:
+    volumeMounts:
+      - mountPath: /var/workdir
+        name: workdir
+    env:
+      - name: IMAGE_EXPIRES_AFTER
+        value: $(params.ociArtifactExpiresAfter)
+      - name: "ORAS_OPTIONS"
+        value: "$(params.orasOptions)"
+      - name: "DEBUG"
+        value: "$(params.trustedArtifactsDebug)"
+    securityContext:
+      runAsUser: 1001
+  steps:
+    - name: use-trusted-artifact
+      computeResources:
+        limits:
+          memory: 64Mi
+        requests:
+          memory: 64Mi
+          cpu: 30m
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: stepactions/use-trusted-artifact/use-trusted-artifact.yaml
+      params:
+        - name: workDir
+          value: $(params.dataDir)
+        - name: sourceDataArtifact
+          value: $(params.sourceDataArtifact)
+    - name: send-signing-request
+      image: quay.io/konflux-ci/release-service-utils:d08bdfa3733a7c75d5334aaa77b7aa46fbace00b
+      computeResources:
+        limits:
+          memory: 2Gi
+        requests:
+          memory: 2Gi
+          cpu: "1"
+      env:
+        - name: SNAPSHOT_SPEC_FILE
+          value: $(params.dataDir)/$(params.snapshotPath)
+        - name: DATA_FILE
+          value: $(params.dataDir)/$(params.dataPath)
+      script: |
+        #!/usr/bin/env bash
+        set -e
+
+        if [ ! -f "${SNAPSHOT_SPEC_FILE}" ] ; then
+            echo "No valid snapshot file was provided."
+            exit 1
+        fi
+
+        if [ ! -f "${DATA_FILE}" ] ; then
+            echo "No data JSON was provided."
+            exit 1
+        fi
+
+        RPA_FILE="$(params.dataDir)/$(params.releasePlanAdmissionPath)"
+        if [ ! -f "${RPA_FILE}" ] ; then
+            echo "No valid rpa file was provided."
+            exit 1
+        fi
+
+        for dir in /var/workdir/release/*/; do
+          # Remove trailing slash
+          dir=${dir%/}
+
+          folder_name=$(basename "${dir}")
+
+          echo "Processing folder: ${folder_name}"
+          echo "Full path: ${dir}"
+
+          ls -l "${dir}"
+          if ls "${dir}"/*.rpm 1> /dev/null 2>&1; then
+            echo "Found RPMs in ${folder_name}"
+            for rpm_file in "${dir}"/*.rpm; do
+              echo "  - RPM: $(basename ${rpm_file})"
+            done
+          else
+            echo "No RPMs found in ${folder_name}"
+          fi
+        done
+
+        set -x
+
+        RUNNING_JOBS="\j" # Bash parameter for number of jobs currently running
+        CONCURRENT_LIMIT=$(params.concurrentLimit)
+        REQUEST_COUNT=0
+        FAILED_COUNT=0
+        PIPELINERUN_LABEL="internal-services.appstudio.openshift.io/pipelinerun-uid"
+
+        # Extract signing configuration from data file
+        PRINCIPAL=$(jq --exit-status -r '.signOptions.signKeytab.principal' "${DATA_FILE}")
+        KEYTAB_FILE=$(jq --exit-status -r '.signOptions.signKeytab.name' "${DATA_FILE}")
+        SECRET=$(jq --exit-status -r '.signOptions.signKeytab.secret' "${DATA_FILE}")
+        PIPELINE_IMAGE=$(jq --exit-status -r '.signOptions.signPipelineImage' "${DATA_FILE}")
+        SIGN_KEY_ALIAS=$(jq --exit-status -r '.signOptions.signKeyAlias.key' "${DATA_FILE}")
+
+        NUM_COMPONENTS=$(jq '.components | length' "${SNAPSHOT_SPEC_FILE}")
+
+        echo "Processing ${NUM_COMPONENTS} components for signing..."
+
+        # Process all components in parallel with concurrency control
+        for (( i = 0; i < NUM_COMPONENTS; i++ )); do
+            component=$(jq -c --argjson i "$i" '.components[$i]' "${SNAPSHOT_SPEC_FILE}")
+            containerImage=$(jq -r '.containerImage' <<< "$component")
+            componentName=$(jq -r '.name' <<< "$component")
+
+            # Wait if we've reached the concurrent limit
+            while (( ${RUNNING_JOBS@P} >= "$CONCURRENT_LIMIT" )); do
+                if ! wait -n; then
+                    ((++FAILED_COUNT))
+                fi
+            done
+
+            echo "Processing RPM component: ${componentName}"
+            echo "Container image: ${containerImage}"
+
+            # Create component directory and extract RPMs from container image
+            COMPONENT_DIR="$(params.dataDir)/${componentName}"
+            mkdir -p "${COMPONENT_DIR}"
+            cd "${COMPONENT_DIR}"
+
+            # Create auth file for oras pull
+            authFile=$(mktemp)
+            select-oci-auth "${containerImage}" > "$authFile"
+
+            # Pull RPMs from container image
+            echo "Pulling RPMs from container image..."
+            oras pull --registry-config "$authFile" "$containerImage"
+            rm -f "$authFile"
+
+            # List extracted RPMs
+            echo "Extracted RPMs:"
+            find . -name "*.rpm" -type f
+
+            # Count RPMs
+            RPM_COUNT=$(find . -name "*.rpm" -type f | wc -l)
+            echo "Found ${RPM_COUNT} RPM files for ${componentName}"
+
+            if [ "${RPM_COUNT}" -eq 0 ]; then
+                echo "Warning: No RPMs found for component ${componentName}"
+                cd "$(params.dataDir)"
+                continue
+            fi
+
+            # List all files extracted from container image
+            echo "All files extracted from container image:"
+            find . -type f | head -20
+            TOTAL_FILES=$(find . -type f | wc -l)
+            echo "Total files: ${TOTAL_FILES}"
+
+            # Return to data directory
+            cd "$(params.dataDir)"
+
+            # Upload entire component directory as a single trusted artifact
+            component_tag="component-${componentName}-$(date +%s)"
+            component_artifact_url="$(params.ociStorage):${component_tag}"
+
+            echo "Uploading entire component directory as trusted artifact..."
+            echo "Component: ${componentName}"
+            echo "Artifact URL: ${component_artifact_url}"
+
+            # Create tarball of entire component directory (using relative path)
+            tar_file="${componentName}.tar.gz"
+            tar czf "${tar_file}" -C "${componentName}" .
+
+            # Upload tarball to OCI storage
+            authFile=$(mktemp)
+            select-oci-auth "$(params.ociStorage)" > "$authFile"
+            oras push --registry-config "$authFile" "${component_artifact_url}" "${tar_file}:application/gzip"
+            rm -f "$authFile"
+            rm -f "${tar_file}"
+
+            echo "Component artifact uploaded successfully"
+
+            # Wait if we've reached the concurrent limit
+            while (( ${RUNNING_JOBS@P} >= "$CONCURRENT_LIMIT" )); do
+                if ! wait -n; then
+                    ((++FAILED_COUNT))
+                fi
+            done
+
+            # Create single InternalRequest for the component
+            echo "Creating internal-request to sign component: ${componentName}"
+
+            internal-request \
+              --pipeline "rpm-signing-pipeline" \
+              -p pipeline_image="${PIPELINE_IMAGE}" \
+              -p component_name="${componentName}" \
+              -p component_artifact="${component_artifact_url}" \
+              -p ociStorage="$(params.ociStorage)" \
+              -p principal="${PRINCIPAL}" \
+              -p keytab_file="${KEYTAB_FILE}" \
+              -p secret_name="${SECRET}" \
+              -p sign_key_alias="${SIGN_KEY_ALIAS}" \
+              -p requester="$(params.requester)" \
+              -p taskGitUrl="$(params.taskGitUrl)" \
+              -p taskGitRevision="$(params.taskGitRevision)" \
+              -l ${PIPELINERUN_LABEL}="$(params.pipelineRunUid)" \
+              -t "$(params.requestTimeout)" \
+              --pipeline-timeout "0h30m0s" \
+              --task-timeout "0h25m0s" \
+              -s true &
+
+            ((++REQUEST_COUNT))
+            echo "Request Count: $REQUEST_COUNT"
+        done
+
+        echo "Waiting for remaining processes to finish..."
+        while (( ${RUNNING_JOBS@P} > 0 )); do
+            if ! wait -n; then
+                ((++FAILED_COUNT))
+                echo "DEBUG: A background job failed. FAILED_COUNT is now: $FAILED_COUNT"
+            fi
+        done
+
+        echo "All signing requests completed. Total requests: $REQUEST_COUNT"
+        echo "DEBUG: Final FAILED_COUNT: $FAILED_COUNT"
+
+        if [ "$FAILED_COUNT" -gt 0 ]; then
+            echo "Error: $FAILED_COUNT signing request(s) failed"
+            exit 1
+        fi
+
+        echo "done"
+    - name: create-trusted-artifact
+      computeResources:
+        limits:
+          memory: 128Mi
+        requests:
+          memory: 128Mi
+          cpu: 250m
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: "$(params.taskGitUrl)"
+          - name: revision
+            value: "$(params.taskGitRevision)"
+          - name: pathInRepo
+            value: stepactions/create-trusted-artifact/create-trusted-artifact.yaml
+      params:
+        - name: ociStorage
+          value: $(params.ociStorage)
+        - name: workDir
+          value: $(params.dataDir)
+        - name: sourceDataArtifact
+          value: $(results.sourceDataArtifact.path)

@@ -1,0 +1,138 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: send-rpm-siging-request
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: release
+spec:
+  description: |-
+    Tekton task to send signing request to signing server.
+    - This task is meant to be used in an internal pipeline that can be triggered frequently
+      and is expected to complete as quickly as possible.
+  params:
+    - description: An image with rh-siging-client needed for the signing
+      name: pipeline_image
+      type: string
+    - name: keytab_file
+      description: keytab file which is used when running with rh-siging-client tool
+      type: string
+    - name: secret_name
+      description: Service account name
+      type: string
+    - name: sign_key_alias
+      description: Sign key alias
+      type: string
+    - name: component_name
+      description: Name of the component to be signed
+      type: string
+    - name: component_artifact
+      description: OCI artifact URL containing all component files
+      type: string
+    - name: ociStorage
+      description: The OCI repository where the Trusted Artifacts are stored
+      type: string
+    - name: requester
+      description: Name of the user that requested the signing, for auditing purposes
+      type: string
+  volumes:
+    - name: secret-volume
+      secret:
+        secretName: "$(params.secret_name)"
+  steps:
+    - name: send-signing-request
+      image: "$(params.pipeline_image)"
+      computeResources:
+        limits:
+          memory: 128Mi
+        requests:
+          memory: 128Mi
+          cpu: 100m
+      workingDir: "$(workspaces.data.path)"
+      script: |
+        #!/usr/bin/env /bin/bash
+        set -x
+
+        # Determine signing client based on keytab_file name
+        KEYTAB_FILE="$(params.keytab_file)"
+        if [[ "${KEYTAB_FILE}" == *"stage"* ]]; then
+          SIGNING_CLIENT="rh-signing-client-stage"
+        elif [[ "${KEYTAB_FILE}" == *"prod"* ]]; then
+          SIGNING_CLIENT="rh-signing-client"
+        else
+          echo "Error: Unable to determine environment from keytab_file: ${KEYTAB_FILE}"
+          echo "Expected keytab_file to contain 'stage' or 'prod'"
+          exit 1
+        fi
+
+        echo "Using signing client: ${SIGNING_CLIENT}"
+
+        base64 --decode /etc/secret/keytab > ./"${KEYTAB_FILE}"
+
+        ${SIGNING_CLIENT} --keytab ./"${KEYTAB_FILE}" --list-keys
+
+        # Download component artifact containing all files and sign all RPMs
+        COMPONENT_NAME="$(params.component_name)"
+        COMPONENT_ARTIFACT="$(params.component_artifact)"
+        OCI_STORAGE="$(params.ociStorage)"
+
+        echo "Component to sign: ${COMPONENT_NAME}"
+        echo "Component artifact URL: ${COMPONENT_ARTIFACT}"
+        echo "OCI storage: ${OCI_STORAGE}"
+
+        # Download component artifact (tarball)
+        echo "Downloading component artifact from trusted artifacts..."
+        authFile=$(mktemp)
+        select-oci-auth "${OCI_STORAGE}" > "$authFile"
+        oras pull --registry-config "$authFile" "${COMPONENT_ARTIFACT}"
+        rm -f "$authFile"
+
+        # Find the downloaded tarball
+        TARBALL=$(find . -name "${COMPONENT_NAME}.tar.gz" -type f | head -n 1)
+
+        if [ -z "${TARBALL}" ]; then
+          echo "Error: Component tarball not found: ${COMPONENT_NAME}.tar.gz"
+          echo "Available files:"
+          ls -lah
+          exit 1
+        fi
+
+        echo "Found component tarball: ${TARBALL}"
+
+        # Extract tarball
+        echo "Extracting component files..."
+        mkdir -p "${COMPONENT_NAME}"
+        tar xzf "${TARBALL}" -C "${COMPONENT_NAME}"
+
+        echo "Component directory contents:"
+        ls -lah "${COMPONENT_NAME}"
+
+        # Find all RPM files in the component directory
+        RPM_COUNT=$(find "${COMPONENT_NAME}" -name "*.rpm" -type f | wc -l)
+        echo "Found ${RPM_COUNT} RPM files to sign"
+
+        if [ "${RPM_COUNT}" -eq 0 ]; then
+          echo "Error: No RPM files found in component artifact"
+          exit 1
+        fi
+
+        # Sign each RPM file
+        echo "Signing all RPM files..."
+        SIGNED_COUNT=0
+        find "${COMPONENT_NAME}" -name "*.rpm" -type f | while read -r rpm_file; do
+          rpm_name=$(basename "${rpm_file}")
+          echo "Signing: ${rpm_name}"
+          ${SIGNING_CLIENT} --key $(params.sign_key_alias) "${rpm_file}"
+          ((++SIGNED_COUNT))
+          echo "  - Signed: ${rpm_name} (${SIGNED_COUNT}/${RPM_COUNT})"
+        done
+
+        echo "Signing completed for component: ${COMPONENT_NAME}"
+        echo "Total RPMs signed: ${RPM_COUNT}"
+      volumeMounts:
+        - mountPath: /etc/secret
+          name: secret-volume
+          readOnly: true
+  workspaces:
+    - name: data
