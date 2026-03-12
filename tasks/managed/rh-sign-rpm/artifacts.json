@@ -1,0 +1,30 @@
+{
+  "artifacts": {
+    "samba-gpupdate-4.23.4-1.el9.noarch.rpm": {
+      "labels": {
+        "arch": "noarch",
+        "date": "2026-03-19 13:05:28",
+        "build_id": "manual-upload",
+        "namespace": "rplesnik-test"
+      },
+      "url": "https://packages.redhat.com/api/pulp-content/konflux-rplesnik-test-namespace/manual-upload/rpms/Packages/s/samba-gpupdate-4.23.4-1.el9.noarch.rpm",
+      "sha256": "9a142bf84f0e5429e49679cf21ab2f6f73e158500a8a498cfd31263695df42e8"
+    },
+    "samba-4.23.4-1.el9.src.rpm": {
+      "labels": {
+        "arch": "src",
+        "date": "2026-03-19 13:05:28",
+        "build_id": "manual-upload",
+        "namespace": "rplesnik-test"
+      },
+      "url": "https://packages.redhat.com/api/pulp-content/konflux-rplesnik-test-namespace/manual-upload/rpms/Packages/s/samba-4.23.4-1.el9.src.rpm",
+      "sha256": "105dc0785c7d10cfe1e757b7443a61d999061381ec310f177c8da8dbc7cde30e"
+    }
+  },
+  "distributions": {
+    "rpms": "https://packages.redhat.com/api/pulp-content/konflux-rplesnik-test-namespace/manual-upload/rpms/",
+    "logs": "https://packages.redhat.com/api/pulp-content/konflux-rplesnik-test-namespace/manual-upload/logs/",
+    "sbom": "https://packages.redhat.com/api/pulp-content/konflux-rplesnik-test-namespace/manual-upload/sbom/",
+    "artifacts": "https://packages.redhat.com/api/pulp-content/konflux-rplesnik-test-namespace/manual-upload/artifacts/"
+  }
+}

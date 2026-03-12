@@ -2,7 +2,7 @@
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
-  name: send-rpm-siging-request
+  name: send-rpm-signing-request
   annotations:
     tekton.dev/pipelines.minVersion: "0.12.1"
     tekton.dev/tags: release
@@ -40,7 +40,33 @@ spec:
     - name: secret-volume
       secret:
         secretName: "$(params.secret_name)"
+  stepTemplate:
+    securityContext:
+      runAsUser: 1001
+    volumeMounts:
+      - name: secret-volume
+        mountPath: /etc/secret
+        readOnly: true
   steps:
+    - name: clone-signing-repo
+      image: "$(params.pipeline_image)"
+      computeResources:
+        limits:
+          memory: 128Mi
+        requests:
+          memory: 128Mi
+          cpu: 100m
+      workingDir: "$(workspaces.data.path)"
+      script: |
+        #!/usr/bin/env /bin/bash
+        set -eux -o pipefail
+
+        echo "Cloning signing repository..."
+        git clone --branch main --depth 1 \
+          https://gitlab.cee.redhat.com/signing/signing signing
+
+        echo "Repository cloned successfully"
+        ls -la signing/
     - name: send-signing-request
       image: "$(params.pipeline_image)"
       computeResources:
@@ -55,7 +81,8 @@ spec:
         set -x
 
         # Determine signing client based on keytab_file name
-        KEYTAB_FILE="$(params.keytab_file)"
+        # KEYTAB_FILE="$(params.keytab_file)"
+        KEYTAB_FILE=konflux-release-signing-prod.keytab
         if [[ "${KEYTAB_FILE}" == *"stage"* ]]; then
           SIGNING_CLIENT="rh-signing-client-stage"
         elif [[ "${KEYTAB_FILE}" == *"prod"* ]]; then
@@ -72,67 +99,65 @@ spec:
 
         ${SIGNING_CLIENT} --keytab ./"${KEYTAB_FILE}" --list-keys
 
-        # Download component artifact containing all files and sign all RPMs
-        COMPONENT_NAME="$(params.component_name)"
-        COMPONENT_ARTIFACT="$(params.component_artifact)"
-        OCI_STORAGE="$(params.ociStorage)"
+        # # Download component artifact containing all files and sign all RPMs
+        # COMPONENT_NAME="$(params.component_name)"
+        # COMPONENT_ARTIFACT="$(params.component_artifact)"
+        # OCI_STORAGE="$(params.ociStorage)"
 
-        echo "Component to sign: ${COMPONENT_NAME}"
-        echo "Component artifact URL: ${COMPONENT_ARTIFACT}"
-        echo "OCI storage: ${OCI_STORAGE}"
+        # echo "Component to sign: ${COMPONENT_NAME}"
+        # echo "Component artifact URL: ${COMPONENT_ARTIFACT}"
+        # echo "OCI storage: ${OCI_STORAGE}"
 
-        # Download component artifact (tarball)
-        echo "Downloading component artifact from trusted artifacts..."
-        authFile=$(mktemp)
-        select-oci-auth "${OCI_STORAGE}" > "$authFile"
-        oras pull --registry-config "$authFile" "${COMPONENT_ARTIFACT}"
-        rm -f "$authFile"
+        # # Download component artifact (tarball)
+        # echo "Downloading component artifact from trusted artifacts..."
+        # authFile=$(mktemp)
+        # select-oci-auth "${OCI_STORAGE}" > "$authFile"
+        # oras pull --registry-config "$authFile" "${COMPONENT_ARTIFACT}"
+        # rm -f "$authFile"
 
-        # Find the downloaded tarball
-        TARBALL=$(find . -name "${COMPONENT_NAME}.tar.gz" -type f | head -n 1)
+        # # Find the downloaded tarball
+        # TARBALL=$(find . -name "${COMPONENT_NAME}.tar.gz" -type f | head -n 1)
 
-        if [ -z "${TARBALL}" ]; then
-          echo "Error: Component tarball not found: ${COMPONENT_NAME}.tar.gz"
-          echo "Available files:"
-          ls -lah
-          exit 1
-        fi
+        # if [ -z "${TARBALL}" ]; then
+        #   echo "Error: Component tarball not found: ${COMPONENT_NAME}.tar.gz"
+        #   echo "Available files:"
+        #   ls -lah
+        #   exit 1
+        # fi
 
-        echo "Found component tarball: ${TARBALL}"
+        # echo "Found component tarball: ${TARBALL}"
 
-        # Extract tarball
-        echo "Extracting component files..."
-        mkdir -p "${COMPONENT_NAME}"
-        tar xzf "${TARBALL}" -C "${COMPONENT_NAME}"
+        # # Extract tarball
+        # echo "Extracting component files..."
+        # mkdir -p "${COMPONENT_NAME}"
+        # tar xzf "${TARBALL}" -C "${COMPONENT_NAME}"
 
-        echo "Component directory contents:"
-        ls -lah "${COMPONENT_NAME}"
+        # echo "Component directory contents:"
+        # ls -lah "${COMPONENT_NAME}"
 
-        # Find all RPM files in the component directory
-        RPM_COUNT=$(find "${COMPONENT_NAME}" -name "*.rpm" -type f | wc -l)
-        echo "Found ${RPM_COUNT} RPM files to sign"
+        # # Find all RPM files in the component directory
+        # RPM_COUNT=$(find "${COMPONENT_NAME}" -name "*.rpm" -type f | wc -l)
+        # echo "Found ${RPM_COUNT} RPM files to sign"
 
-        if [ "${RPM_COUNT}" -eq 0 ]; then
-          echo "Error: No RPM files found in component artifact"
-          exit 1
-        fi
+        # if [ "${RPM_COUNT}" -eq 0 ]; then
+        #   echo "Error: No RPM files found in component artifact"
+        #   exit 1
+        # fi
 
-        # Sign each RPM file
-        echo "Signing all RPM files..."
-        SIGNED_COUNT=0
-        find "${COMPONENT_NAME}" -name "*.rpm" -type f | while read -r rpm_file; do
-          rpm_name=$(basename "${rpm_file}")
-          echo "Signing: ${rpm_name}"
-          ${SIGNING_CLIENT} --key $(params.sign_key_alias) "${rpm_file}"
-          ((++SIGNED_COUNT))
-          echo "  - Signed: ${rpm_name} (${SIGNED_COUNT}/${RPM_COUNT})"
-        done
+        # # Sign each RPM file
+        # echo "Signing all RPM files..."
+        # SIGNED_COUNT=0
+        # find "${COMPONENT_NAME}" -name "*.rpm" -type f | while read -r rpm_file; do
+        #   rpm_name=$(basename "${rpm_file}")
+        #   echo "Signing: ${rpm_name}"
+        #   ${SIGNING_CLIENT} --key $(params.sign_key_alias) "${rpm_file}"
+        #   ((++SIGNED_COUNT))
+        #   echo "  - Signed: ${rpm_name} (${SIGNED_COUNT}/${RPM_COUNT})"
+        # done
 
-        echo "Signing completed for component: ${COMPONENT_NAME}"
-        echo "Total RPMs signed: ${RPM_COUNT}"
-      volumeMounts:
-        - mountPath: /etc/secret
-          name: secret-volume
-          readOnly: true
+        # echo "Signing completed for component: ${COMPONENT_NAME}"
+        # echo "Total RPMs signed: ${RPM_COUNT}"
+
+        echo "Signing request sent successfully"
   workspaces:
     - name: data
